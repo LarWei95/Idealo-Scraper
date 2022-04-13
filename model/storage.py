@@ -6,7 +6,19 @@ Created on 05.01.2022
 from abc import ABC, abstractmethod
 import sqlite3
 
+import mysql.connector
+import time
+import numpy as np
 import pandas as pd
+import datetime as dt
+from io import BytesIO, StringIO
+import gzip
+
+
+def _escape_string (string):
+    string = string.replace("\"", "\\\"")
+    string = string.replace("'", "\\'")
+    return string
 
 class Storage(ABC):
 
@@ -23,10 +35,6 @@ class Storage(ABC):
     
     @abstractmethod
     def store_prices (self, product_id, df):
-        pass
-    
-    @abstractmethod
-    def get_products (self, product_id=None, category_id=None):
         pass
         
 class SQLiteStorage (Storage):
@@ -166,4 +174,492 @@ class SQLiteStorage (Storage):
         df = pd.DataFrame(rows, columns=["ProdId", "Name", "CatId"])
         df = df.set_index("ProdId")
         return df
+        
+class _DBCon ():
+    def __init__ (self, host, user, passwd, db_name):
+        self._host = host
+        self._user = user
+        self._passwd = passwd
+        self._db_name = db_name
+        
+        self._con = None
+        
+    def __enter__ (self):
+        attempts = 1000
+        last_attempt = attempts - 1
+        
+        for attempt in range(attempts):
+            try:
+                self._con = mysql.connector.connect(
+                        host=self._host,
+                        user=self._user,
+                        password=self._passwd,
+                        database=self._db_name
+                    )
+                return self._con.cursor()
+            except Exception as e:
+                if attempt != last_attempt:
+                    if attempt % 100 == 0:
+                        print("Failed to connect - {:d}: {:s}".format(
+                                attempt, str(e)
+                            ))
+                        
+                    time.sleep(1)
+                else:
+                    raise e
+    
+    def __exit__ (self, exc_type, exc_val, exc_tb):
+        self._con.commit()
+        self._con.close()
+        
+class MySQLStorage (Storage):
+    CATEGORY_COLUMNS = ["CategoryId", "CategoryName"]
+    CATEGORY_INDEX = "CategoryId"
+    
+    PRODUCT_COLUMNS = ["ProductId", "ProductName", "CategoryId", "Datasheet"]
+    PRODUCT_INDEX = "ProductId"
+    
+    PRODUCT_PRICE_COLUMNS = ["ProductId", "Date", "Price"]
+    PRODUCT_PRICE_INDEX = ["ProductId", "Date"]
+    
+    CATEGORY_PRODUCT_PRICE_COLUMNS = ["CategoryId", "ProductId", "Date", "Price"]
+    CATEGORY_PRODUCT_PRICE_INDEX = ["CategoryId", "ProductId", "Date"]
+    
+    LAST_PRICE_DATE_COLUMNS = ["ProductId", "Date"]
+    LAST_PRICE_DATE_INDEX = "ProductId"
+    
+    LAST_PRICE_AGE_COLUMNS = ["ProductId", "Age"]
+    LAST_PRICE_AGE_INDEX = "ProductId"
+    
+    UPDATE_RUN_COLUMNS = ["Date", "ProductId", "Period"]
+    UPDATE_RUN_INDEX = ["Date", "ProductId"]
+    
+    def __init__ (self, host, user, passwd, db_name="idealo_data"):
+        self._host = host
+        self._user = user
+        self._passwd = passwd
+        self._db_name = db_name
+        
+        self._initialize()
+    
+    
+    def _create_database (self):
+        self._con = _DBCon(self._host, self._user, self._passwd, None)
+        
+        with self._con as cur:
+            sql = "CREATE DATABASE IF NOT EXISTS {:s};".format(
+                    self._db_name
+                )
+            cur.execute(sql)
+            
+        self._con = _DBCon(self._host, self._user, self._passwd, self._db_name)
+        
+    def _create_category_table (self, cur):
+        sql = """CREATE TABLE IF NOT EXISTS category (
+            cid INTEGER UNSIGNED PRIMARY KEY,
+            name TEXT NOT NULL
+        );"""
+        cur.execute(sql)
+        
+    def _create_product_table (self, cur):
+        sql = """CREATE TABLE IF NOT EXISTS product (
+            pid INTEGER UNSIGNED PRIMARY KEY,
+            name TEXT NOT NULL,
+            cid INTEGER UNSIGNED NOT NULL,
+            datasheet BLOB NULL,
+            
+            FOREIGN KEY (cid)
+                REFERENCES category(cid)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE
+        );"""
+        cur.execute(sql)
+        
+    def _create_price_table (self, cur):
+        sql = """
+        CREATE TABLE IF NOT EXISTS price (
+            pid INTEGER UNSIGNED,
+            date DATE NOT NULL,
+            price DOUBLE UNSIGNED NOT NULL,
+            PRIMARY KEY (pid, date),
+            FOREIGN KEY (pid)
+                REFERENCES product (pid)
+                    ON DELETE CASCADE
+                    ON UPDATE NO ACTION
+        );"""
+        cur.execute(sql)
+        
+    def _create_last_price_date_table (self, cur):
+        sql = """
+        CREATE TABLE IF NOT EXISTS last_price_date (
+            pid INTEGER UNSIGNED PRIMARY KEY,
+            date DATE NOT NULL,
+            
+            FOREIGN KEY (pid)
+                REFERENCES product (pid)
+                    ON DELETE CASCADE
+                    ON UPDATE NO ACTION
+        );"""
+        cur.execute(sql)
+        
+    def _create_update_run_table (self, cur):
+        sql = """
+        CREATE TABLE IF NOT EXISTS update_run (
+            date DATETIME,
+            pid INTEGER UNSIGNED,
+            period VARCHAR(5),
+            
+            PRIMARY KEY (date, pid),
+            FOREIGN KEY (pid)
+                REFERENCES product (pid)
+                    ON DELETE CASCADE
+                    ON UPDATE NO ACTION
+        );"""
+        cur.execute(sql)
+        
+    def _create_price_insert_trigger (self, cur):
+        sql = """
+        CREATE TRIGGER IF NOT EXISTS insert_price_trigger
+        AFTER INSERT
+        ON price
+        FOR EACH ROW
+        INSERT INTO last_price_date (pid, date)
+        VALUES (NEW.pid, NEW.date)
+        ON DUPLICATE KEY UPDATE date = GREATEST(date, VALUES(date));
+        """
+        cur.execute(sql)
+        
+    def _initialize (self):
+        self._create_database()
+        
+        with self._con as cur:
+            self._create_category_table(cur)
+            self._create_product_table(cur)
+            self._create_price_table(cur)
+            self._create_last_price_date_table(cur)
+            self._create_update_run_table(cur)
+            
+            self._create_price_insert_trigger(cur)
+            
+    def get_category (self, category_id=None):
+        if category_id is not None:
+            sql = "SELECT cid, name FROM category WHERE cid {:s};"
+            
+            if isinstance(category_id, (list, tuple)):
+                subsql = ",".join(str(x) for x in category_id)
+                sql = sql.format("IN ({:s})".format(subsql))
+            else:
+                subsql = str(category_id)
+                sql = sql.format("= {:s}".format(subsql))
+        else:
+            sql = "SELECT cid, name FROM category;"
+            
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+                
+        s = pd.DataFrame(rows, columns=MySQLStorage.CATEGORY_COLUMNS)
+        s = s.set_index(MySQLStorage.CATEGORY_INDEX)
+        return s
+                
+            
+    def store_category (self, category_id, category_name):
+        sql = """INSERT INTO category (cid, name) 
+        VALUES ({:d}, \"{:s}\")
+        ON DUPLICATE KEY UPDATE
+            name = VALUES(name)
+        ;"""
+        sql = sql.format(category_id, _escape_string(category_name))
+        
+        with self._con as cur:
+            cur.execute(sql)
+            
+    def store_product (self, product_id, name, category_id, datasheet):
+        if datasheet is not None:
+            bytesio = BytesIO()
+            
+            with gzip.open(bytesio, "wb") as f:
+                stringio = StringIO()
+                datasheet.to_csv(stringio, sep=";", line_terminator="\n")
+                
+                stringio = stringio.getvalue().encode("utf-8")
+                
+                f.write(stringio)
+                
+            datasheet = bytesio.getvalue().hex()
+            datasheet = "X'{:s}'".format(datasheet)
+        else:
+            datasheet = "NULL"
+        
+        
+        sql = """INSERT INTO product (pid, name, cid, datasheet)
+        VALUES ({:d}, \"{:s}\", {:d}, {:s})
+        ON DUPLICATE KEY UPDATE
+            name = VALUES(NAME),
+            cid = VALUES(cid),
+            datasheet = VALUES(datasheet);""".format(
+                product_id, _escape_string(name),
+                category_id,
+                datasheet
+            )
+        
+        with self._con as cur:
+            cur.execute(sql)
+            
+    def store_prices (self, product_id, df):
+        sql = """INSERT INTO price (pid, date, price)
+        VALUES {:s}
+        ON DUPLICATE KEY UPDATE
+            price = VALUES(price);"""
+        
+        fmt = "({:d},\"{:s}\", {:f})"
+        
+        values = []
+        
+        for ind in df.index:
+            value = df[ind]
+            
+            ind = ind.strftime("%Y-%m-%d")
+            value = fmt.format(product_id, ind, value)
+            values.append(value)
+
+        values = ",".join(values)
+        sql = sql.format(values)
+        
+        with self._con as cur:
+            cur.execute(sql)
+            
+    def store_update_runs (self, update_df):
+        # update_df:
+        # Index: ProductId
+        # Columns: Period (e.g. P3M), Date (datetime)
+        
+        sql = """INSERT INTO update_run (date, pid, period)
+        VALUES {:s}
+        ON DUPLICATE KEY UPDATE 
+            date = VALUES(date), pid = VALUES(pid), period = VALUES(period);"""
+        
+        fmt = "(\"{:s}\",{:d},\"{:s}\")"
+        lines = []
+        
+        for product_id in update_df.index:
+            v = update_df.loc[product_id]
+            period = v["Period"]
+            date = v["Date"].to_pydatetime()
+            date = date.strftime("%Y-%m-%d %H:%M:%S")
+            
+            lines.append(fmt.format(date, product_id, period))
+            
+            if len(lines) >= 1000:
+                subsql = sql.format(",".join(lines))
+                lines.clear()
+                
+                with self._con as cur:
+                    cur.execute(subsql)
+            
+        if len(lines) != 0:
+            sql = sql.format(",".join(lines))
+            
+            with self._con as cur:
+                cur.execute(sql)
+        
+    @classmethod
+    def _get_product_info_selector (cls, product_id, category_id):
+        selectors = []
+        
+        if product_id is not None:
+            if isinstance(product_id, (list, tuple, np.ndarray)):
+                sel = "p.pid IN({:s})".format(
+                        ",".join(str(x) for x in product_id)
+                    )
+            else:
+                sel = "p.pid = {:d}".format(product_id)
+                
+            selectors.append(sel)
+        
+        if category_id is not None:
+            if isinstance(category_id, (list, tuple, np.ndarray)):
+                sel = "p.cid IN({:s})".format(
+                        ",".join(str(x) for x in category_id)
+                    )
+            else:
+                sel = "p.cid = {:d}".format(category_id)
+                
+            selectors.append(sel)
+            
+        if len(selectors) != 0:
+            selectors = " AND ".join(selectors)
+            selectors = " WHERE {:s}".format(selectors)
+        else:
+            selectors = ""
+            
+        return selectors
+        
+            
+    @classmethod
+    def _process_byte_string (cls, string):
+        string = string.replace(b"\xa0", b" ")
+        string = string.replace(b"\xc2", b"")
+        string = string.replace(b"\xb0", b"deg")
+        
+        string = string.decode("iso-8859-1")
+        return string
+            
+    def get_product_info (self, product_id=None, category_id=None):
+        sql = """SELECT p.pid, p.name, p.cid, p.datasheet
+            FROM product AS p
+            {:s};""".format(
+                    MySQLStorage._get_product_info_selector(product_id,
+                                                            category_id)
+                )
+                
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+        new_rows = []
+        
+        for pid, name, cid, datasheet in rows:
+            bytesio = BytesIO(datasheet)
+            
+            with gzip.open(bytesio, "rb") as f:
+                datasheet = f.read()
+                
+            datasheet = MySQLStorage._process_byte_string(datasheet)
+                
+            datasheet = StringIO(datasheet)
+            datasheet = pd.read_csv(datasheet, sep=";", lineterminator="\n",
+                                    index_col=[0, 1])["0"]
+            
+            new_rows.append((pid, name, cid, datasheet))
+            
+        s = pd.DataFrame(new_rows, columns=MySQLStorage.PRODUCT_COLUMNS)
+        s = s.set_index(MySQLStorage.PRODUCT_INDEX)
+        return s
+    
+    
+            
+    def get_prices_of_product (self, product_id):
+        sql = """SELECT p.pid, pr.date, pr.price
+        FROM product AS p
+        INNER JOIN price AS pr
+            ON p.pid = pr.pid
+        WHERE p.pid {:s};"""
+        
+        multi = isinstance(product_id, (list, tuple))
+        
+        if multi:
+            subsql = ",".join(str(x) for x in product_id)
+            sql = sql.format("IN ({:s})".format(subsql))
+            
+            with self._con as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            
+            df = pd.DataFrame(rows, columns=MySQLStorage.PRODUCT_PRICE_COLUMNS)
+            df = df.set_index(MySQLStorage.PRODUCT_PRICE_INDEX)
+        else:
+            subsql = str(product_id)
+            sql = sql.format("= {:s}".format(subsql))
+            
+            with self._con as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                
+            df = pd.DataFrame(rows, columns=MySQLStorage.PRODUCT_PRICE_COLUMNS)
+            df = df.drop(MySQLStorage.PRODUCT_PRICE_INDEX[0], axis=1)
+            df = df.set_index(MySQLStorage.PRODUCT_PRICE_INDEX[1])
+            
+        df = df.sort_index()
+        return df
+            
+    def get_prices_of_category (self, category_id):
+        sql = """SELECT c.cid, p.pid, pr.date, pr.price
+        FROM category AS c
+        INNER JOIN product AS p
+            ON c.cid = p.cid
+        INNER JOIN price AS pr
+            ON p.pid = pr.pid
+        WHERE c.cid {:s};"""
+            
+        multi = isinstance(category_id, (list, tuple))
+        
+        if multi:
+            subsql = ",".join(str(x) for x in category_id)
+            sql = sql.format("IN ({:s})".format(subsql))
+            
+            with self._con as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            
+            df = pd.DataFrame(rows, columns=MySQLStorage.CATEGORY_PRODUCT_PRICE_COLUMNS)
+            df = df.set_index(MySQLStorage.CATEGORY_PRODUCT_PRICE_INDEX)
+        else:
+            subsql = str(category_id)
+            sql = sql.format("= {:s}".format(subsql))
+            
+            with self._con as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                
+            df = pd.DataFrame(rows, columns=MySQLStorage.CATEGORY_PRODUCT_PRICE_COLUMNS)
+            df = df.drop(MySQLStorage.CATEGORY_PRODUCT_PRICE_INDEX[0], axis=1)
+            df = df.set_index(MySQLStorage.CATEGORY_PRODUCT_PRICE_INDEX[1:])
+            
+        df = df.sort_index()
+        return df
+    
+    def get_last_price_dates (self):
+        sql = """
+        SELECT pid, date
+        FROM last_price_date
+        ORDER BY date ASC;"""
+        
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+        df = pd.DataFrame(rows, columns=MySQLStorage.LAST_PRICE_DATE_COLUMNS)
+        df = df.set_index(MySQLStorage.LAST_PRICE_DATE_INDEX)
+        return df
+    
+    def get_last_price_ages (self, reference_datetime):
+        sql = """
+        SELECT pid, TIMESTAMPDIFF(SECOND, date, \"{:s}\") "age"
+        FROM last_price_date
+        ORDER BY date ASC;
+        """.format(str(reference_datetime))
+        
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+        df = pd.DataFrame(rows, columns=MySQLStorage.LAST_PRICE_AGE_COLUMNS)
+        df = df.set_index(MySQLStorage.LAST_PRICE_AGE_INDEX)
+        df["Age"] = pd.to_timedelta(df["Age"], unit="S")
+        return df
+    
+    def get_update_runs (self):
+        sql = """
+        SELECT date, pid, period
+        FROM update_run;"""
+        
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+        df = pd.DataFrame(rows, columns=MySQLStorage.UPDATE_RUN_COLUMNS)
+        df = df.set_index(MySQLStorage.UPDATE_RUN_INDEX)
+        return df
+        
+    def delete_update_run (self, date, product_id):
+        sql = """DELETE FROM update_run
+        WHERE date = \"{:s}\" AND pid = {:d};
+        """.format(
+                date.strftime("%Y-%m-%d %H:%M:%S"),
+                product_id
+            )
+        
+        with self._con as cur:
+            cur.execute(sql)
         
