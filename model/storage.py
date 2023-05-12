@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 import sqlite3
 
 import mysql.connector
+import mysql.connector.errors as mysqlerrors
 import time
 import numpy as np
 import pandas as pd
@@ -19,6 +20,12 @@ def _escape_string (string):
     string = string.replace("\"", "\\\"")
     string = string.replace("'", "\\'")
     return string
+
+class StorageInsertError(Exception):
+    MESSAGE_BASE = "Storing data failed with the following info:\n{:s}"
+
+    def __init__(self, msg):
+        super().__init__(StorageInsertError.MESSAGE_BASE.format(msg))
 
 class Storage(ABC):
 
@@ -213,28 +220,45 @@ class _DBCon ():
         self._con.close()
         
 class MySQLStorage (Storage):
-    CATEGORY_COLUMNS = ["CategoryId", "CategoryName"]
-    CATEGORY_INDEX = "CategoryId"
+    V_CATEGORY_ID = "CategoryId"
+    V_CATEGORY_NAME = "CategoryName"
+    V_PRODUCT_ID = "ProductId"
+    V_PRODUCT_NAME = "ProductName"
+    V_DATE = "Date"
+    V_TIMESTAMP = "Timestamp"
+    V_PRICE = "Price"
+    V_DATASHEET = "Datasheet"
+    V_AGE = "Age"
+    V_PERIOD = "Period"
+
+    CATEGORY_COLUMNS = [V_CATEGORY_ID, V_CATEGORY_NAME]
+    CATEGORY_INDEX = V_CATEGORY_ID
+
+    CATEGORY_UPDATE_COLUMNS = [V_CATEGORY_ID, V_TIMESTAMP]
+    CATEGORY_UPDATE_INDEX = V_CATEGORY_ID
     
-    PRODUCT_COLUMNS = ["ProductId", "ProductName", "CategoryId", "Datasheet"]
-    PRODUCT_INDEX = "ProductId"
+    PRODUCT_COLUMNS = [V_PRODUCT_ID, V_PRODUCT_NAME, V_CATEGORY_ID, V_DATASHEET]
+    PRODUCT_INDEX = V_PRODUCT_ID
     
-    PRODUCT_PRICE_COLUMNS = ["ProductId", "Date", "Price"]
-    PRODUCT_PRICE_INDEX = ["ProductId", "Date"]
+    PRODUCT_PRICE_COLUMNS = [V_PRODUCT_ID, V_DATE, V_PRICE]
+    PRODUCT_PRICE_INDEX = [V_PRODUCT_ID, V_DATE]
     
-    CATEGORY_PRODUCT_PRICE_COLUMNS = ["CategoryId", "ProductId", "Date", "Price"]
-    CATEGORY_PRODUCT_PRICE_INDEX = ["CategoryId", "ProductId", "Date"]
+    CATEGORY_PRODUCT_PRICE_COLUMNS = [V_CATEGORY_ID, V_PRODUCT_ID, V_DATE, V_PRICE]
+    CATEGORY_PRODUCT_PRICE_INDEX = [V_CATEGORY_ID, V_PRODUCT_ID, V_DATE]
     
-    LAST_PRICE_DATE_COLUMNS = ["ProductId", "Date"]
-    LAST_PRICE_DATE_INDEX = "ProductId"
+    LAST_PRICE_DATE_COLUMNS = [V_PRODUCT_ID, V_DATE]
+    LAST_PRICE_DATE_INDEX = V_PRODUCT_ID
     
-    LAST_PRICE_AGE_COLUMNS = ["ProductId", "Age"]
-    LAST_PRICE_AGE_INDEX = "ProductId"
+    LAST_PRICE_AGE_COLUMNS = [V_PRODUCT_ID, V_AGE]
+    LAST_PRICE_AGE_INDEX = V_PRODUCT_ID
     
-    UPDATE_RUN_COLUMNS = ["Date", "ProductId", "Period"]
-    UPDATE_RUN_INDEX = ["Date", "ProductId"]
+    UPDATE_RUN_COLUMNS = [V_DATE, V_PRODUCT_ID, V_PERIOD]
+    UPDATE_RUN_INDEX = [V_DATE, V_PRODUCT_ID]
     
-    def __init__ (self, host, user, passwd, db_name="idealo_data"):
+    CATEGORY_UPDATE_RUN_COLUMNS = [V_TIMESTAMP, V_CATEGORY_ID]
+    CATEGORY_UPDATE_RUN_INDEX = V_CATEGORY_ID
+    
+    def __init__(self, host, user, passwd, db_name="idealo_data"):
         self._host = host
         self._user = user
         self._passwd = passwd
@@ -243,7 +267,7 @@ class MySQLStorage (Storage):
         self._initialize()
     
     
-    def _create_database (self):
+    def _create_database(self):
         self._con = _DBCon(self._host, self._user, self._passwd, None)
         
         with self._con as cur:
@@ -254,14 +278,39 @@ class MySQLStorage (Storage):
             
         self._con = _DBCon(self._host, self._user, self._passwd, self._db_name)
         
-    def _create_category_table (self, cur):
+    def _create_category_table(self, cur):
         sql = """CREATE TABLE IF NOT EXISTS category (
             cid INTEGER UNSIGNED PRIMARY KEY,
             name TEXT NOT NULL
         );"""
         cur.execute(sql)
+
+    def _create_last_category_update_table(self, cur):
+        sql = """CREATE TABLE IF NOT EXISTS last_category_update (
+            cid INTEGER UNSIGNED PRIMARY KEY,
+            ts DATETIME NOT NULL,
+
+            FOREIGN KEY(cid)
+                REFERENCES category (cid)
+                    ON DELETE CASCADE
+                    ON UPDATE NO ACTION
+        );"""
+        cur.execute(sql)
         
-    def _create_product_table (self, cur):
+    def _create_category_update_run_table(self, cur):
+        sql = """
+        CREATE TABLE IF NOT EXISTS category_update_run (
+            ts DATETIME,
+            cid INTEGER UNSIGNED PRIMARY KEY,
+
+            FOREIGN KEY (cid)
+                REFERENCES category (cid)
+                    ON DELETE CASCADE
+                    ON UPDATE NO ACTION
+        );"""
+        cur.execute(sql)
+
+    def _create_product_table(self, cur):
         sql = """CREATE TABLE IF NOT EXISTS product (
             pid INTEGER UNSIGNED PRIMARY KEY,
             name TEXT NOT NULL,
@@ -275,7 +324,7 @@ class MySQLStorage (Storage):
         );"""
         cur.execute(sql)
         
-    def _create_price_table (self, cur):
+    def _create_price_table(self, cur):
         sql = """
         CREATE TABLE IF NOT EXISTS price (
             pid INTEGER UNSIGNED,
@@ -289,7 +338,7 @@ class MySQLStorage (Storage):
         );"""
         cur.execute(sql)
         
-    def _create_last_price_date_table (self, cur):
+    def _create_last_price_date_table(self, cur):
         sql = """
         CREATE TABLE IF NOT EXISTS last_price_date (
             pid INTEGER UNSIGNED PRIMARY KEY,
@@ -302,7 +351,7 @@ class MySQLStorage (Storage):
         );"""
         cur.execute(sql)
         
-    def _create_update_run_table (self, cur):
+    def _create_update_run_table(self, cur):
         sql = """
         CREATE TABLE IF NOT EXISTS update_run (
             date DATETIME,
@@ -316,10 +365,43 @@ class MySQLStorage (Storage):
                     ON UPDATE NO ACTION
         );"""
         cur.execute(sql)
-        
-    def _create_price_insert_trigger (self, cur):
+
+    def _create_category_update_run_delete_trigger(self, cur):
+        sql = "DROP TRIGGER IF EXISTS delete_category_update_run_trigger;"
+        cur.execute(sql)
+
         sql = """
-        CREATE TRIGGER IF NOT EXISTS insert_price_trigger
+        CREATE TRIGGER delete_category_update_run_trigger
+        AFTER DELETE
+        ON category_update_run
+        FOR EACH ROW
+        INSERT INTO last_category_update (cid, ts)
+        VALUES (OLD.cid, UTC_TIMESTAMP())
+        ON DUPLICATE KEY UPDATE
+        ts = UTC_TIMESTAMP()
+        """
+        cur.execute(sql)
+    
+    def _create_category_insert_trigger(self, cur):
+        sql = "DROP TRIGGER IF EXISTS insert_category_trigger;"
+        cur.execute(sql)
+
+        sql = """
+        CREATE TRIGGER insert_category_trigger
+        AFTER INSERT
+        ON category
+        FOR EACH ROW
+        INSERT IGNORE INTO last_category_update (cid, ts)
+        VALUES (NEW.cid, UTC_TIMESTAMP());
+        """
+        cur.execute(sql)
+
+    def _create_price_insert_trigger(self, cur):
+        sql = "DROP TRIGGER IF EXISTS insert_price_trigger;"
+        cur.execute(sql)
+
+        sql = """
+        CREATE TRIGGER insert_price_trigger
         AFTER INSERT
         ON price
         FOR EACH ROW
@@ -329,19 +411,23 @@ class MySQLStorage (Storage):
         """
         cur.execute(sql)
         
-    def _initialize (self):
+    def _initialize(self):
         self._create_database()
         
         with self._con as cur:
             self._create_category_table(cur)
+            self._create_last_category_update_table(cur) 
+            self._create_category_update_run_table(cur)
             self._create_product_table(cur)
             self._create_price_table(cur)
             self._create_last_price_date_table(cur)
             self._create_update_run_table(cur)
             
+            self._create_category_update_run_delete_trigger(cur)
+            self._create_category_insert_trigger(cur)
             self._create_price_insert_trigger(cur)
             
-    def get_category (self, category_id=None):
+    def get_category(self, category_id=None):
         if category_id is not None:
             sql = "SELECT cid, name FROM category WHERE cid {:s};"
             
@@ -362,6 +448,67 @@ class MySQLStorage (Storage):
         s = s.set_index(MySQLStorage.CATEGORY_INDEX)
         return s
                 
+    def get_last_category_update(self, category_id=None):
+        if category_id is not None:
+            sql = "SELECT cid, ts FROM last_category_update WHERE cid {:s};"
+
+            if isinstance(category_id, (list, tuple)):
+                subsql = ",".join(str(x) for x in category_id)
+                sql = sql.format(f"IN ({subsql})")
+            else:
+                sql = sql.format(f"= {category_id}")
+        else:
+            sql = "SELECT cid, ts FROM last_category_update;"
+
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+
+        s = pd.DataFrame(rows, columns=MySQLStorage.CATEGORY_UPDATE_COLUMNS)
+        s = s.set_index(MySQLStorage.CATEGORY_UPDATE_INDEX)
+        return s
+    
+    def get_category_update_run(self, category_id=None):
+        if category_id is not None:
+            sql = "SELECT ts, cid FROM category_update_run WHERE cid {:s};"
+
+            if isinstance(category_id, (list, tuple)):
+                subsql = ",".join(str(x) for x in category_id)
+                sql = sql.format(f"IN ({subsql})")
+            else:
+                sql = sql.format(f"= {category_id}")
+        else:
+            sql = "SELECT ts, cid FROM category_update_run;"
+
+        with self._con as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+
+        s = pd.DataFrame(rows, columns=MySQLStorage.CATEGORY_UPDATE_RUN_COLUMNS)
+        s = s.set_index(MySQLStorage.CATEGORY_UPDATE_RUN_INDEX)
+        return s
+
+    def store_last_category_update(self, category_id, timestamp):
+        timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        sql = f"""INSERT INTO last_category_update (cid, ts)
+        VALUES ({category_id}, \"{timestamp}\")
+        ON DUPLICATE KEY UPDATE
+            ts = VALUES(last);"""
+
+        with self._con as cur:
+            cur.execute(sql)
+
+    def store_category_update_run(self, category_id, timestamp):
+        timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        sql = f"""INSERT INTO category_update_run (ts, cid)
+        VALUES (\"{timestamp}\", {category_id})
+        ON DUPLICATE KEY UPDATE
+            ts = VALUES(ts);"""
+
+        with self._con as cur:
+            cur.execute(sql)
             
     def store_category (self, category_id, category_name):
         sql = """INSERT INTO category (cid, name) 
@@ -402,10 +549,14 @@ class MySQLStorage (Storage):
                 category_id,
                 datasheet
             )
-        
-        with self._con as cur:
-            cur.execute(sql)
-            
+        try: 
+            with self._con as cur:
+                cur.execute(sql)
+        except mysqlerrors.DatabaseError as e:
+            msg = f"Product {product_id} {name} {category_id}"
+            raise StorageInsertError(msg)
+
+
     def store_prices (self, product_id, df):
         sql = """INSERT INTO price (pid, date, price)
         VALUES {:s}
@@ -426,9 +577,14 @@ class MySQLStorage (Storage):
         values = ",".join(values)
         sql = sql.format(values)
         
-        with self._con as cur:
-            cur.execute(sql)
-            
+        try:
+            with self._con as cur:
+                cur.execute(sql)
+        except mysqlerrors.DatabaseError as e:
+            msg = f"Prices for {product_id}"
+            raise StorageInsertError(msg)
+
+
     def store_update_runs (self, update_df):
         # update_df:
         # Index: ProductId
@@ -444,8 +600,8 @@ class MySQLStorage (Storage):
         
         for product_id in update_df.index:
             v = update_df.loc[product_id]
-            period = v["Period"]
-            date = v["Date"].to_pydatetime()
+            period = v[MySQLStorage.V_PERIOD]
+            date = v[MySQLStorage.V_DATE].to_pydatetime()
             date = date.strftime("%Y-%m-%d %H:%M:%S")
             
             lines.append(fmt.format(date, product_id, period))
@@ -462,7 +618,13 @@ class MySQLStorage (Storage):
             
             with self._con as cur:
                 cur.execute(sql)
-        
+    
+    def delete_category_update_run(self, category_id):
+        sql = f"DELETE FROM category_update_run WHERE cid = {category_id};"
+
+        with self._con as cur:
+            cur.execute(sql)
+
     @classmethod
     def _get_product_info_selector (cls, product_id, category_id):
         selectors = []
@@ -517,6 +679,7 @@ class MySQLStorage (Storage):
             cur.execute(sql)
             rows = cur.fetchall()
             
+                
         new_rows = []
         
         for pid, name, cid, datasheet in rows:
@@ -528,10 +691,13 @@ class MySQLStorage (Storage):
             datasheet = MySQLStorage._process_byte_string(datasheet)
                 
             datasheet = StringIO(datasheet)
-            datasheet = pd.read_csv(datasheet, sep=";", lineterminator="\n",
-                                    index_col=[0, 1])["0"]
-            
-            new_rows.append((pid, name, cid, datasheet))
+
+            try:
+                datasheet = pd.read_csv(datasheet, sep=";", lineterminator="\n",
+                                        index_col=[0, 1])["0"]
+                new_rows.append((pid, name, cid, datasheet))
+            except pd.errors.EmptyDataError:
+                continue
             
         s = pd.DataFrame(new_rows, columns=MySQLStorage.PRODUCT_COLUMNS)
         s = s.set_index(MySQLStorage.PRODUCT_INDEX)
@@ -636,7 +802,7 @@ class MySQLStorage (Storage):
             
         df = pd.DataFrame(rows, columns=MySQLStorage.LAST_PRICE_AGE_COLUMNS)
         df = df.set_index(MySQLStorage.LAST_PRICE_AGE_INDEX)
-        df["Age"] = pd.to_timedelta(df["Age"], unit="S")
+        df[MySQLStorage.V_AGE] = pd.to_timedelta(df[MySQLStorage.V_AGE], unit="S")
         return df
     
     def get_update_runs (self):

@@ -70,10 +70,10 @@ class WebRequestManager (RequestManager):
             if max_age is None:
                 max_age = self._max_age
             
-            max_date = dt.datetime.now()
+            max_date = dt.datetime.utcnow()
             min_date = max_date - max_age
         else:
-            max_date = dt.datetime.now()
+            max_date = dt.datetime.utcnow()
         
         request_id = self._api.post_page_request(url, header, 
                                                  accepted_status=status_codes,
@@ -100,8 +100,9 @@ class IdealoRequester ():
             "User-Agent" : "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:97.0) Gecko/20100101 Firefox/97.0"
         }
     
-    PRODOFFERS_SEGMENT_FORMAT = "https://www.idealo.de/offerpage/offerlist/product/{:s}/start/{:d}/sort/default?includeFilters=0&excludeFilters="
-    API_FORMAT = "https://www.idealo.de/offerpage/pricechart/api/{:d}?period={:s}"
+    URL_BASE = "https://www.idealo.de" 
+    PRODOFFERS_SEGMENT_FORMAT = URL_BASE+"/offerpage/offerlist/product/{:s}/start/{:d}/sort/default?includeFilters=0&excludeFilters="
+    API_FORMAT = URL_BASE+"/offerpage/pricechart/api/{:d}?period={:s}"
     API_PERIODS = {
             dt.timedelta(days=30) : "P1M",
             dt.timedelta(days=90) : "P3M",
@@ -111,9 +112,8 @@ class IdealoRequester ():
             dt.timedelta(days=500) : "P500D"
         }
     SORTED_API_PERIODS = sorted(list(API_PERIODS.keys()))
-    
-    CAT_START_FORMAT = "https://www.idealo.de/preisvergleich/ProductCategory/{:d}.html"
-    CAT_CONT_FORMAT = "https://www.idealo.de/preisvergleich/ProductCategory/{:d}I16-{:d}.html"
+    CAT_START_FORMAT = URL_BASE+"/preisvergleich/ProductCategory/{:d}.html"
+    CAT_CONT_FORMAT = URL_BASE+"/preisvergleich/ProductCategory/{:d}I16-{:d}.html"
     
     def __init__ (self, request_manager):
         # Time to wait before each request in order to
@@ -143,7 +143,14 @@ class IdealoRequester ():
         
         if isinstance(product_id, int):
             url = IdealoRequester.API_FORMAT.format(product_id, period)
-            html, _ = self._reqman.fetch(self._reqman.request(url, IdealoRequester.HEADERS_DICT, max_age, min_date))
+            html, _ = self._reqman.fetch(
+                        self._reqman.request(
+                                url, 
+                                IdealoRequester.HEADERS_DICT, 
+                                max_age=max_age, 
+                                min_date=min_date
+                        )
+            )
             
             data = json.loads(html.decode("utf-8"))["data"]
             
@@ -175,7 +182,14 @@ class IdealoRequester ():
             
             for pid, cmax_age, cmin_date, cperiod in zip(product_id, max_age, min_date, period):
                 url = IdealoRequester.API_FORMAT.format(pid, cperiod)
-                keys.append(self._reqman.request(url, IdealoRequester.HEADERS_DICT, max_age=cmax_age, min_date=cmin_date))
+                keys.append(
+                    self._reqman.request(
+                        url, 
+                        IdealoRequester.HEADERS_DICT,
+                        max_age=cmax_age,
+                        min_date=cmin_date
+                    )
+                )
                 
             datas = {}
                 
@@ -241,9 +255,17 @@ class IdealoRequester ():
             
         return all_products
         
-    def get_name_of_category (self, category_id):
+    def get_name_of_category (self, category_id, max_age=None, min_date=None):
         url = IdealoRequester.CAT_START_FORMAT.format(category_id)
-        content, _ = self._reqman.fetch(self._reqman.request(url, IdealoRequester.HEADERS_DICT, 200))
+        content, _ = self._reqman.fetch(
+            self._reqman.request(
+                url,
+                IdealoRequester.HEADERS_DICT,
+                200,
+                max_age=max_age,
+                min_date=min_date
+            )
+        )
         
         content = BeautifulSoup(content, "html.parser")
         header = content.find("div", {"class" : "category-headline"})
@@ -251,7 +273,7 @@ class IdealoRequester ():
         
         return header
         
-    def get_products_of_category (self, category_id):
+    def get_products_of_category (self, category_id, max_age=None, min_date=None):
         # https://www.idealo.de/preisvergleich/ProductCategory/16073.html
         # https://www.idealo.de/preisvergleich/ProductCategory/16073I16-15.html
         # Index zu hoch -> 301 Moved Permanently, Verweis auf Anfangsseite
@@ -276,7 +298,13 @@ class IdealoRequester ():
                 else:
                     url = IdealoRequester.CAT_CONT_FORMAT.format(category_id, offset)
                     
-                request_id = self._reqman.request(url, IdealoRequester.HEADERS_DICT, [200, 301])
+                request_id = self._reqman.request(
+                    url,
+                    IdealoRequester.HEADERS_DICT,
+                    [200, 301],
+                    max_age=max_age,
+                    min_date=min_date
+                )
                 request_ids.append(request_id)
                 
             hit_final_page = False
@@ -310,18 +338,21 @@ class IdealoRequester ():
             urls = set()
             
             for variant_box in html:
-                urls.add("https://www.idealo.de"+variant_box["href"].strip())
+                urls.add(cls.URL_BASE+variant_box["href"].strip())
             
             return urls
     
-    def get_product_variants_of_product_detail_page (self, pdp_dict):
+    def get_product_variants_of_product_detail_page (self, pdp_dict, max_age=None, min_date=None):
         # pdp_dict: {Product ID : Product Detail URL}
         
         request_ids = {
                 product_id : self._reqman.request(
                     pdp_dict[product_id], 
                     IdealoRequester.HEADERS_DICT,
-                    200)
+                    200,
+                    max_age=max_age,
+                    min_date=min_date
+                )
                 for product_id in pdp_dict
             }
         
@@ -416,14 +447,16 @@ class IdealoRequester ():
         
         return product_name, datasheet
     
-    def get_details_from_variant_pages (self, variant_page_dict):
+    def get_details_from_variant_pages (self, variant_page_dict, max_age=None, min_date=None):
         # variant_page_dict: {Product ID : Variant Page URL}
         
         request_ids = {
                 product_id : self._reqman.request(
                         variant_page_dict[product_id],
                         IdealoRequester.HEADERS_DICT,
-                        200
+                        200,
+                        max_age=max_age,
+                        min_date=min_date
                     )
                 for product_id in variant_page_dict
             }

@@ -4,9 +4,13 @@ Created on 14.02.2022
 @author: larsw
 '''
 from pprint import pprint
+from model.storage import MySQLStorage, StorageInsertError
 from control.scraping import IdealoRequester
 import datetime as dt
 import numpy as np
+import sys
+import traceback as tb
+
 
 class Loader(object):
     '''
@@ -18,12 +22,14 @@ class Loader(object):
         self._storage = storage
         self._scraper = scraper
         
-    def load_products_of_category (self, category_id):
-        category_name = self._scraper.get_name_of_category(category_id)
+    def load_products_of_category (self, category_id, min_date=None):
+        category_name = self._scraper.get_name_of_category(category_id,
+                                                           min_date=min_date)
         self._storage.store_category(category_id, category_name)
         
         # Product ID -> (Name, Product URL)
-        product_ids = self._scraper.get_products_of_category(category_id)
+        product_ids = self._scraper.get_products_of_category(category_id,
+                                                             min_date=min_date)
         
         # {ProductID : Product URL}
         product_detail_pages = {}
@@ -31,13 +37,13 @@ class Loader(object):
         for product_id in product_ids:
             # Product Name, Product URL
             _, product_url = product_ids[product_id]
-            product_detail_pages[product_id] = product_url
+            product_detail_pages[product_id] = IdealoRequester.URL_BASE+product_url
             
         return product_detail_pages
             
-    def load_prices (self, product_ids):
+    def load_prices (self, product_ids, min_date=None):
         # Product ID -> Series
-        prices = self._scraper.get_api(product_ids)
+        prices = self._scraper.get_api(product_ids, min_date=min_date)
         
         for product_id in prices:
             series = prices[product_id]
@@ -45,29 +51,49 @@ class Loader(object):
             
         return prices
     
-    def load_product_variants (self, variant_urls, product_categories):
+    def load_product_variants (self, variant_urls, product_categories, min_date=None):
         # variant_urls: {Product ID : Product URL}
         # product_categories: {Product ID : Category ID}
         
         # {Product ID : (Product Name, Datasheet (uncompressed))}
-        product_details = self._scraper.get_details_from_variant_pages(variant_urls)
+        product_details = self._scraper.get_details_from_variant_pages(variant_urls,
+                                                                       min_date=min_date)
         
+        stored_pids = []
+
         for product_id in product_details:
             category_id = product_categories[product_id]
             product_name, datasheet = product_details[product_id]
             
-            self._storage.store_product(product_id, product_name, 
-                                        category_id, datasheet)
-            
-        self.load_prices(list(variant_urls.keys()))
+            try:
+                self._storage.store_product(product_id, product_name, 
+                                            category_id, datasheet)
+                stored_pids.append(product_id)
+            except StorageInsertError as e:
+                errmsg = f"""Product storage failed with
+                PID: {product_id}
+                CID: {category_id}
+                Name: {product_name}
+                Datasheet:
+                {datasheet}
+                """
+                print(errmsg, file=sys.stderr)
+                tb.print_exc()
+
+        self.load_prices(stored_pids, min_date=min_date)
     
-    def load_full_category (self, category_id):        
+    def load_full_category (self, category_id, min_date=None):        
         # {ProductID : Product Detail Page}
-        product_detail_urls = self.load_products_of_category(category_id)
+        product_detail_urls = self.load_products_of_category(category_id,
+                                                             min_date=min_date)
         print("Product detail URLs: "+str(len(product_detail_urls)))
-        
+        pprint(product_detail_urls, indent=3)
+
         # {Product ID : [URL1, URL2, ...]
-        variant_urls = self._scraper.get_product_variants_of_product_detail_page(product_detail_urls)
+        variant_urls = self._scraper.get_product_variants_of_product_detail_page(
+                    product_detail_urls,
+                    min_date=min_date
+        )
         pprint(variant_urls)
         # {Variant Product ID : Variant URL}
         variant_urls = {
@@ -78,13 +104,15 @@ class Loader(object):
         print("Variant URLs: "+str(len(variant_urls)))
         
         # {Product ID : (Product Name, Datasheet (uncompressed))}
-        product_details = self._scraper.get_details_from_variant_pages(variant_urls)
+        product_details = self._scraper.get_details_from_variant_pages(variant_urls,
+                                                                       min_date=min_date)
         product_categories = {x : category_id for x in product_details}
-        self.load_product_variants(variant_urls, product_categories)
+        self.load_product_variants(variant_urls, product_categories,
+                                   min_date=min_date)
         
     def _get_executeable_update_runs (self, update_runs, min_update_age):
         if len(update_runs) == 0:
-            now = dt.datetime.now()
+            now = dt.datetime.utcnow()
             last_price_ages = self._storage.get_last_price_ages(now)
             sel = last_price_ages["Age"] >= min_update_age
             last_price_ages = last_price_ages[sel]
@@ -129,3 +157,44 @@ class Loader(object):
             run_date = v["Date"].to_pydatetime()
             
             self._storage.delete_update_run(run_date, product_id)
+
+    def _update_category_indices(self, updateable_df):
+        # updateable_df: V_CATEGORY_ID -> [V_TIMESTAMP]
+        
+        for category_id in updateable_df.index.values:
+            timestamp = updateable_df.loc[category_id][MySQLStorage.V_TIMESTAMP]
+            print(f"Update of {category_id} at {timestamp}")
+
+            # Loading category ...
+            self.load_full_category(category_id, min_date=timestamp)
+
+            self._storage.delete_category_update_run(category_id) 
+    
+    def _run_current_category_update_runs(self):
+        # V_CATEGORY_ID -> V_TIMESTAMP 
+        update_runs = self._storage.get_category_update_run()
+
+        if len(update_runs) != 0:
+            self._update_category_indices(update_runs)
+
+    def _select_updateable_categories(self, last_updates, min_update_age):
+        # V_CATEGORY_ID -> V_TIMESTAMP 
+
+        last_updates[MySQLStorage.V_TIMESTAMP] += min_update_age
+        selector = last_updates[MySQLStorage.V_TIMESTAMP] <= dt.datetime.utcnow()
+        last_updates = last_updates[selector]
+        return last_updates.index.unique()
+
+    def update_categories(self, min_update_age):
+        self._run_current_category_update_runs()
+
+        # V_CATEGORY_ID -> V_TIMESTAMP 
+        last_updates = self._storage.get_last_category_update()
+        updateables = self._select_updateable_categories(last_updates,
+                                                         min_update_age)
+        utcnow = dt.datetime.utcnow()
+
+        for updateable in updateables:
+            self._storage.store_category_update_run(updateable, utcnow)
+        
+        self._run_current_category_update_runs()

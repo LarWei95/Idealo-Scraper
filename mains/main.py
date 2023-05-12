@@ -19,28 +19,27 @@ from control.datasheet import Datasheet
 # 7712
 
 def main ():
-    with open("../credentials.json", "r") as f:
+    with open("credentials.json", "r") as f:
         credentials = json.load(f)
     
     user = credentials["user"]
     password = credentials["password"]
     
-    storage = MySQLStorage("localhost", user, password)
-    api = WebRequestAPIClient("http://127.0.0.1", 5000)
+
+    print("Opened the credentials. Connecting to database.")
+    storage = MySQLStorage("192.168.188.23", user, password)
+    api = WebRequestAPIClient("http://172.25.0.2", 35353)
     request_manager = WebRequestManager(api, dt.timedelta(weeks=54))
-    
+
     requester = IdealoRequester(request_manager)
     
     loader = Loader(storage, requester)
-    
-    # loader.update_prices(dt.timedelta(days=2))
-    # last_price_ages = storage.get_last_price_ages(dt.datetime.now())
-    
-    # print(last_price_ages)
-    # print(last_price_ages["Age"] >= dt.timedelta(days=30))
-        
-    
-    
+    print("Required connections built. Executing updates.")
+
+    loader.update_categories(dt.timedelta(days=31*9))
+    print("Done updating categories.")
+    loader.update_prices(dt.timedelta(days=7))
+    print("Done updating prices.")
     # Externe Festplatten
     # loader.load_full_category(7712)
     # Grafikkarten
@@ -131,11 +130,12 @@ def main ():
     # loader.load_full_category(4734)
     
     # Laufschuhe 22875
-    loader.load_full_category(22875)
+    # loader.load_full_category(22875)
     # Sneaker 18817
-    loader.load_full_category(18817)
+    # loader.load_full_category(18817)
+    
     # Outdoor-Schuhe 18854
-    loader.load_full_category(18854)
+    # loader.load_full_category(18854)
         
 def graphics_card_performance (storage):
     cid = 16073

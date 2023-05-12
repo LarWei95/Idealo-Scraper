@@ -136,3 +136,5 @@ data.db
 credentials.json
 *.csv
 *.har
+
+*.swp
